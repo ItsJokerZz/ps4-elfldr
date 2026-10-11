@@ -17,6 +17,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/types.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -26,10 +27,12 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/mman.h>
 #include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 
 #include "elfldr.h"
 #include "log.h"
@@ -44,6 +47,20 @@ along with this program; see the file COPYING. If not, see
 #define PAYLOAD_MAGIC_SELF 0x1D3D154F // SELF payload
 #define PAYLOAD_MAGIC_FILE 0x656C6966 // file:// URI
 #define PAYLOAD_MAGIC_HTTP 0x70747468 // http:// or https:// URI
+
+/**
+ * A tracked launch request starts with TRACK_MAGIC, followed by the length of
+ * the payload input (32 bits, big endian), the input itself, and the payload.
+ * The payload gets the input on stdin instead of the client socket, and the
+ * client gets TRACK_REPLY ("TPID") followed by the pid (both 32 bits, big
+ * endian). A payload that is given input confirms that it has consumed it by
+ * writing TRACK_READY to stdout within TRACK_TIMEOUT seconds.
+ **/
+#define PAYLOAD_MAGIC_TRACK 0x43415254
+#define TRACK_MAGIC "TRACKED"
+#define TRACK_REPLY 0x54504944
+#define TRACK_READY "PAYLOAD_READY\n"
+#define TRACK_TIMEOUT 15
 
 /**
  * Decode an escaped argument.
@@ -142,6 +159,97 @@ payload_spawn(char *filename, char *args, int fd, uint8_t *payload,
 }
 
 /**
+ * Read the header of a tracked launch request.
+ **/
+static int
+track_read(int fd, char *input, size_t size, uint32_t *input_len) {
+  char magic[sizeof(TRACK_MAGIC) - 1];
+  uint32_t len;
+
+  if(recv(fd, magic, sizeof(magic), MSG_WAITALL) != sizeof(magic)
+     || memcmp(magic, TRACK_MAGIC, sizeof(magic))) {
+    return -1;
+  }
+
+  if(recv(fd, &len, sizeof(len), MSG_WAITALL) != sizeof(len)) {
+    return -1;
+  }
+
+  len = ntohl(len);
+  if(len >= size) {
+    return -1;
+  }
+
+  if(len && recv(fd, input, len, MSG_WAITALL) != len) {
+    return -1;
+  }
+
+  *input_len = len;
+
+  return 0;
+}
+
+/**
+ * Spawn a payload that is detached from the client socket, and tell the
+ * client which pid it got.
+ **/
+static void
+track_spawn(char *filename, char *args, int fd, uint8_t *payload,
+            size_t payload_size, const char *input, uint32_t input_len) {
+  struct timeval timeout = { TRACK_TIMEOUT, 0 };
+  char ready[sizeof(TRACK_READY) - 1];
+  int pair[2] = { -1, -1 };
+  uint32_t reply[2];
+  pid_t pid = -1;
+  size_t off = 0;
+  int io = -1;
+  ssize_t n;
+
+  // Keep payload stdout separate from the launch acknowledgement.
+  if(!input_len) {
+    io = open("/dev/null", O_RDWR);
+  } else if(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) {
+    setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if(write(pair[0], input, input_len) == input_len) {
+      io = pair[1];
+    }
+    shutdown(pair[0], SHUT_WR);
+  }
+
+  if(io >= 0) {
+    pid = payload_spawn(filename, args, io, payload, payload_size);
+  }
+
+  // Payloads that are given input confirm that they consumed it.
+  if(pid > 0 && input_len) {
+    if(recv(pair[0], ready, sizeof(ready), MSG_WAITALL) != sizeof(ready)
+       || memcmp(ready, TRACK_READY, sizeof(ready))) {
+      kill(pid, SIGKILL);
+      pid = -1;
+    }
+  }
+
+  if(pair[0] >= 0) {
+    close(pair[0]);
+  }
+  if(pair[1] >= 0) {
+    close(pair[1]);
+  }
+  if(!input_len && io >= 0) {
+    close(io);
+  }
+
+  reply[0] = htonl(TRACK_REPLY);
+  reply[1] = htonl(pid);
+  while(off < sizeof(reply)) {
+    if((n = send(fd, (char *)reply + off, sizeof(reply) - off, 0)) <= 0) {
+      break;
+    }
+    off += n;
+  }
+}
+
+/**
  *
  **/
 static int
@@ -178,10 +286,14 @@ static void
 on_connection(int fd) {
   char *filename = "payload.elf";
   char uri[PATH_MAX + 1] = { 0 };
+  uint32_t input_len = 0;
   uint8_t *buf = 0;
+  char input[192];
   size_t len = 0;
   int optval = 1;
   char *args = "";
+  int tracked = 0;
+  int mapped = 0;
   int magic = 0;
 
   if(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0) {
@@ -196,6 +308,16 @@ on_connection(int fd) {
     return;
   }
 
+  if(magic == PAYLOAD_MAGIC_TRACK) {
+    if(track_read(fd, input, sizeof(input), &input_len)
+       || recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL)
+              != sizeof(magic)) {
+      LOG_PERROR("track_read");
+      return;
+    }
+    tracked = 1;
+  }
+
   if(magic == PAYLOAD_MAGIC_FILE || magic == PAYLOAD_MAGIC_HTTP) {
     if(payload_readuri(fd, uri, PATH_MAX)
        || uri_get_content(uri, &buf, &len)) {
@@ -207,6 +329,8 @@ on_connection(int fd) {
     if(elfldr_read(fd, &buf, &len)) {
       LOG_PERROR("elfldr_read");
       write(fd, "[elfldr.elf] Error reading ELF payload\n\r\0", 41);
+    } else {
+      mapped = 1;
     }
 
   } else if(magic == PAYLOAD_MAGIC_SELF) {
@@ -225,12 +349,18 @@ on_connection(int fd) {
     if(!(args = uri_get_param(uri, "args"))) {
       args = strdup("");
     }
-    if(payload_spawn(filename, args, fd, buf, len) < 0) {
+    if(tracked) {
+      track_spawn(filename, args, fd, buf, len, input, input_len);
+    } else if(payload_spawn(filename, args, fd, buf, len) < 0) {
       write(fd, "[elfldr.elf] Error spawning payload\n\r\0", 38);
     }
     free(filename);
     free(args);
-    free(buf);
+    if(mapped) {
+      munmap(buf, len);
+    } else {
+      free(buf);
+    }
   }
 }
 
