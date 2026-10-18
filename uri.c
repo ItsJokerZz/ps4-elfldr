@@ -22,13 +22,14 @@ along with this program; see the file COPYING. If not, see
 /**
  *
  **/
-typedef struct http2_ctx {
+typedef struct http_ctx {
   int libnetMemId;
   int libsslCtxId;
   int libhttpCtxId;
   int tmplId;
+  int connId;
   int reqId;
-} http2_ctx_t;
+} http_ctx_t;
 
 int sceNetInit(void);
 int sceNetPoolCreate(const char *, int, int);
@@ -37,26 +38,29 @@ int sceNetPoolDestroy(int);
 int sceSslInit(size_t);
 int sceSslTerm(int);
 
-int sceHttp2Init(int, int, size_t, int);
-int sceHttp2Term(int);
+int sceHttpInit(int, int, size_t);
+int sceHttpTerm(int);
 
-int sceHttp2CreateTemplate(int, const char *, int, int);
-int sceHttp2SetSslCallback(int, void *, void *);
-int sceHttp2DeleteTemplate(int);
+int sceHttpCreateTemplate(int, const char *, int, int);
+int sceHttpsSetSslCallback(int, void *, void *);
+int sceHttpSetResponseHeaderMaxSize(int, size_t);
+int sceHttpDeleteTemplate(int);
 
-int sceHttp2CreateRequestWithURL(int, const char *, const char *, uint64_t);
-int sceHttp2DeleteRequest(int);
+int sceHttpCreateConnectionWithURL(int, const char *, int);
+int sceHttpDeleteConnection(int);
 
-int sceHttp2GetResponseContentLength(int, int *, uint64_t *);
-int sceHttp2SendRequest(int, const void *, size_t);
-int sceHttp2GetStatusCode(int, int *);
-int sceHttp2ReadData(int, void *, size_t);
+int sceHttpCreateRequestWithURL(int, int, const char *, uint64_t);
+int sceHttpSendRequest(int, const void *, size_t);
+int sceHttpGetResponseContentLength(int, int *, uint64_t *);
+int sceHttpGetStatusCode(int, int *);
+int sceHttpReadData(int, void *, size_t);
+int sceHttpDeleteRequest(int);
 
 /**
  *
  **/
 static int
-http2_ssl_cb(void) {
+http_ssl_cb(void) {
   return 0;
 }
 
@@ -64,47 +68,57 @@ http2_ssl_cb(void) {
  *
  **/
 static int
-http2_init(http2_ctx_t *ctx, const char *agent, const char *method,
-           const char *url) {
+http_init(http_ctx_t *ctx, const char *agent, const char *url) {
   int err;
 
   ctx->libnetMemId = -1;
   ctx->libsslCtxId = -1;
   ctx->libhttpCtxId = -1;
   ctx->tmplId = -1;
+  ctx->connId = -1;
   ctx->reqId = -1;
 
   if((err = sceNetInit()) < 0) {
     return -1;
   }
 
-  ctx->libnetMemId = sceNetPoolCreate("http2_get", 32 * 1024, 0);
+  ctx->libnetMemId = sceNetPoolCreate("http_get", 16 * 1024, 0);
   if(ctx->libnetMemId < 0) {
     return ctx->libnetMemId;
   }
 
-  ctx->libsslCtxId = sceSslInit(256 * 1024);
+  ctx->libsslCtxId = sceSslInit(128 * 1024);
   if(ctx->libsslCtxId < 0) {
     return ctx->libsslCtxId;
   }
 
   ctx->libhttpCtxId
-      = sceHttp2Init(ctx->libnetMemId, ctx->libsslCtxId, 256 * 1024, 1);
+      = sceHttpInit(ctx->libnetMemId, ctx->libsslCtxId, 32 * 1024);
   if(ctx->libhttpCtxId < 0) {
     return ctx->libhttpCtxId;
   }
 
-  ctx->tmplId = sceHttp2CreateTemplate(ctx->libhttpCtxId, agent, 3, 1);
+  ctx->tmplId = sceHttpCreateTemplate(ctx->libhttpCtxId, agent, 2, 1);
   if(ctx->tmplId < 0) {
     return ctx->tmplId;
   }
 
-  err = sceHttp2SetSslCallback(ctx->tmplId, http2_ssl_cb, 0);
+  err = sceHttpSetResponseHeaderMaxSize(ctx->tmplId, 0x2000);
+  if(err < 0) {
+    return err;
+  }
+
+  err = sceHttpsSetSslCallback(ctx->tmplId, http_ssl_cb, 0);
   if(err) {
     return err;
   }
 
-  ctx->reqId = sceHttp2CreateRequestWithURL(ctx->tmplId, method, url, 0);
+  ctx->connId = sceHttpCreateConnectionWithURL(ctx->tmplId, url, 0);
+  if(ctx->connId < 0) {
+    return ctx->connId;
+  }
+
+  ctx->reqId = sceHttpCreateRequestWithURL(ctx->connId, 0, url, 0);
   if(ctx->reqId < 0) {
     return ctx->reqId;
   }
@@ -116,18 +130,18 @@ http2_init(http2_ctx_t *ctx, const char *agent, const char *method,
  *
  **/
 static int
-http2_request(http2_ctx_t *ctx, uint8_t **data, size_t *len) {
+http_request(http_ctx_t *ctx, uint8_t **data, size_t *len) {
   int status = -1;
   int err;
   int n;
 
-  if((err = sceHttp2SendRequest(ctx->reqId, 0, 0))) {
+  if((err = sceHttpSendRequest(ctx->reqId, 0, 0))) {
     return err;
   }
-  if((err = sceHttp2GetStatusCode(ctx->reqId, &status))) {
+  if((err = sceHttpGetStatusCode(ctx->reqId, &status))) {
     return err;
   }
-  if((err = sceHttp2GetResponseContentLength(ctx->reqId, &err, len))) {
+  if((err = sceHttpGetResponseContentLength(ctx->reqId, &err, len))) {
     return err;
   }
 
@@ -140,7 +154,7 @@ http2_request(http2_ctx_t *ctx, uint8_t **data, size_t *len) {
     return -1;
   }
 
-  if((n = sceHttp2ReadData(ctx->reqId, *data, *len) < 0)) {
+  if((n = sceHttpReadData(ctx->reqId, *data, *len) < 0)) {
     return n;
   }
 
@@ -151,15 +165,18 @@ http2_request(http2_ctx_t *ctx, uint8_t **data, size_t *len) {
  *
  **/
 static void
-http2_fini(http2_ctx_t *ctx) {
+http_fini(http_ctx_t *ctx) {
   if(ctx->reqId >= 0) {
-    sceHttp2DeleteRequest(ctx->reqId);
+    sceHttpDeleteRequest(ctx->reqId);
+  }
+  if(ctx->connId >= 0) {
+    sceHttpDeleteConnection(ctx->connId);
   }
   if(ctx->tmplId >= 0) {
-    sceHttp2DeleteTemplate(ctx->tmplId);
+    sceHttpDeleteTemplate(ctx->tmplId);
   }
   if(ctx->libhttpCtxId >= 0) {
-    sceHttp2Term(ctx->libhttpCtxId);
+    sceHttpTerm(ctx->libhttpCtxId);
   }
   if(ctx->libsslCtxId >= 0) {
     sceSslTerm(ctx->libsslCtxId);
@@ -173,22 +190,22 @@ http2_fini(http2_ctx_t *ctx) {
  *
  **/
 static uint8_t *
-http2_get(const char *url, size_t *len) {
-  http2_ctx_t ctx;
+http_get(const char *url, size_t *len) {
+  http_ctx_t ctx;
   size_t size = 0;
   uint8_t *data;
 
-  if((http2_init(&ctx, "elfldr.elf", "GET", url))) {
-    http2_fini(&ctx);
+  if((http_init(&ctx, "elfldr.elf", url))) {
+    http_fini(&ctx);
     return 0;
   }
 
-  if(http2_request(&ctx, &data, &size) != 200) {
-    http2_fini(&ctx);
+  if(http_request(&ctx, &data, &size) != 200) {
+    http_fini(&ctx);
     return 0;
   }
 
-  http2_fini(&ctx);
+  http_fini(&ctx);
   if(len) {
     *len = size;
   }
@@ -199,8 +216,8 @@ http2_get(const char *url, size_t *len) {
  * Read a payload from he given URL.
  **/
 static int
-url_read(const char *url, uint8_t **payload, size_t *payload_size) {
-  if((*payload = http2_get(url, payload_size))) {
+url_read(const char *url, uint8_t **content, size_t *content_size) {
+  if((*content = http_get(url, content_size))) {
     return 0;
   }
 
