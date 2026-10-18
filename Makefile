@@ -33,8 +33,8 @@ SRCS += $(wildcard *.h)
 
 all: $(ELF) $(BIN)
 
-socksrv.elf: socksrv.c elfldr.c pt.c uri.c selfldr.c notify.c
-	$(CC) $(CFLAGS) -lSceSsl2 -lSceHttp2 $^ -o $@
+socksrv.elf: socksrv.c elfldr.c pt.c uri.c selfldr.c notify.c httpdyn.c
+	$(CC) $(CFLAGS) $^ -o $@
 
 bootstrap-elf.c: socksrv_elf.c
 
