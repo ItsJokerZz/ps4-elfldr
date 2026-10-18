@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/mman.h>
 #include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -182,6 +183,7 @@ on_connection(int fd) {
   size_t len = 0;
   int optval = 1;
   char *args = "";
+  int mapped = 0;
   int magic = 0;
 
   if(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0) {
@@ -207,6 +209,8 @@ on_connection(int fd) {
     if(elfldr_read(fd, &buf, &len)) {
       LOG_PERROR("elfldr_read");
       write(fd, "[elfldr.elf] Error reading ELF payload\n\r\0", 41);
+    } else {
+      mapped = 1;
     }
 
   } else if(magic == PAYLOAD_MAGIC_SELF) {
@@ -230,7 +234,11 @@ on_connection(int fd) {
     }
     free(filename);
     free(args);
-    free(buf);
+    if(mapped) {
+      munmap(buf, len);
+    } else {
+      free(buf);
+    }
   }
 }
 

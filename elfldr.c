@@ -30,7 +30,6 @@ along with this program; see the file COPYING. If not, see
 
 #include <ps4/kernel.h>
 #include <ps4/klog.h>
-#include <ps4/mdbg.h>
 
 #include "elfldr.h"
 #include "log.h"
@@ -163,8 +162,10 @@ elfldr_load(pid_t pid, uint8_t *elf) {
     return 0;
   }
 
-  if(!(ctx.base_mirror = malloc(ctx.base_size))) {
-    LOG_PERROR("malloc");
+  if((ctx.base_mirror = mmap(NULL, ctx.base_size, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0))
+     == MAP_FAILED) {
+    LOG_PERROR("mmap");
     return 0;
   }
 
@@ -173,7 +174,7 @@ elfldr_load(pid_t pid, uint8_t *elf) {
       = pt_mmap(pid, ctx.base_addr, ctx.base_size, prot, flags, -1, 0))
      == -1) {
     LOG_PT_PERROR(pid, "pt_mmap");
-    free(ctx.base_mirror);
+    munmap(ctx.base_mirror, ctx.base_size);
     return 0;
   }
 
@@ -202,8 +203,8 @@ elfldr_load(pid_t pid, uint8_t *elf) {
     }
   }
 
-  if(mdbg_copyin(ctx.pid, ctx.base_mirror, ctx.base_addr, ctx.base_size)) {
-    LOG_PERROR("mdbg_copyin");
+  if(pt_copyin(ctx.pid, ctx.base_mirror, ctx.base_addr, ctx.base_size)) {
+    LOG_PERROR("pt_copyin");
     error = 1;
   }
 
@@ -224,7 +225,7 @@ elfldr_load(pid_t pid, uint8_t *elf) {
     error = 1;
   }
 
-  free(ctx.base_mirror);
+  munmap(ctx.base_mirror, ctx.base_size);
 
   if(error) {
     pt_munmap(pid, ctx.base_addr, ctx.base_size);
@@ -350,11 +351,12 @@ elfldr_exec(pid_t pid, int stdio, uint8_t *elf, size_t elf_size) {
  * Set the heap size for libc.
  **/
 static int
-elfldr_set_heap_size(pid_t pid, uint32_t size) {
+elfldr_set_heap_size(pid_t pid, uint64_t size) {
   intptr_t sceLibcHeapExtendedAlloc;
   intptr_t sceLibcHeapSize;
   intptr_t sceLibcParam;
   intptr_t sceProcParam;
+  uint32_t enabled = 1;
   intptr_t buf;
 
   if((buf = pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
@@ -368,47 +370,48 @@ elfldr_set_heap_size(pid_t pid, uint32_t size) {
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
-  if(!(sceProcParam = mdbg_getlong(pid, buf))) {
-    LOG_PERROR("mdbg_getlong");
+  if(pt_copyout(pid, buf, &sceProcParam, sizeof(sceProcParam))
+     || !sceProcParam) {
+    LOG_PERROR("pt_copyout");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_copyout(pid, sceProcParam + 56, &sceLibcParam,
-                  sizeof(sceLibcParam))) {
-    LOG_PERROR("mdbg_copyout");
+  if(pt_copyout(pid, sceProcParam + 56, &sceLibcParam, sizeof(sceLibcParam))) {
+    LOG_PERROR("pt_copyout");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_copyout(pid, sceLibcParam + 16, &sceLibcHeapSize,
-                  sizeof(sceLibcHeapSize))) {
-    LOG_PERROR("mdbg_copyout");
+  if(pt_copyout(pid, sceLibcParam + 16, &sceLibcHeapSize,
+                sizeof(sceLibcHeapSize))) {
+    LOG_PERROR("pt_copyout");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_setint(pid, sceLibcHeapSize, size)) {
-    LOG_PERROR("mdbg_setint");
+  if(pt_copyin(pid, &size, sceLibcHeapSize, sizeof(size))) {
+    LOG_PERROR("pt_copyin");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(size != -1) {
+  if(size != UINT64_MAX) {
     pt_munmap(pid, buf, PAGE_SIZE);
     return 0;
   }
 
   // sceLibcHeapExtendedAlloc is not allocated when using SceSpZeroConf
   sceLibcHeapExtendedAlloc = buf;
-  if(mdbg_setlong(pid, sceLibcParam + 32, sceLibcHeapExtendedAlloc)) {
-    LOG_PERROR("mdbg_setlong");
+  if(pt_copyin(pid, &sceLibcHeapExtendedAlloc, sceLibcParam + 32,
+               sizeof(sceLibcHeapExtendedAlloc))) {
+    LOG_PERROR("pt_copyin");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_setint(pid, sceLibcHeapExtendedAlloc, 1)) {
-    LOG_PERROR("mdbg_setint");
+  if(pt_copyin(pid, &enabled, sceLibcHeapExtendedAlloc, sizeof(enabled))) {
+    LOG_PERROR("pt_copyin");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
@@ -430,7 +433,7 @@ elfldr_set_procname(pid_t pid, const char *name) {
     return -1;
   }
 
-  mdbg_copyin(pid, name, buf, strlen(name) + 1);
+  pt_copyin(pid, name, buf, strlen(name) + 1);
 
   pt_syscall(pid, SYS_thr_set_name, -1, buf);
   pt_msync(pid, buf, PAGE_SIZE, MS_SYNC);
@@ -499,8 +502,10 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
     return -1;
   }
 
-  if(!(stack = malloc(MB(2)))) {
-    LOG_PERROR("malloc");
+  if((stack = mmap(NULL, MB(2), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0))
+     == MAP_FAILED) {
+    LOG_PERROR("mmap");
     close(kq);
     return -1;
   }
@@ -509,7 +514,7 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
                          elfldr_rfork_entry, (void *)argv))
      < 0) {
     LOG_PERROR("rfork_thread");
-    free(stack);
+    munmap(stack, MB(2));
     close(kq);
     return -1;
   }
@@ -517,7 +522,7 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC | NOTE_EXIT, 0, 0);
   if(kevent(kq, &evt, 1, &evt, 1, 0) < 0) {
     LOG_PERROR("kevent");
-    free(stack);
+    munmap(stack, MB(2));
     close(kq);
     return -1;
   }
@@ -528,12 +533,12 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
     }
     LOG_PERROR("pt_attach");
     kill(pid, SIGKILL);
-    free(stack);
+    munmap(stack, MB(2));
     close(kq);
     return -1;
   }
 
-  free(stack);
+  munmap(stack, MB(2));
   close(kq);
 
   if(pt_dynlib_process_needed_and_relocate(pid)) {
@@ -543,8 +548,10 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
   }
 
   // Allow libc to allocate arbitrary amount of memory.
-  if(elfldr_set_heap_size(pid, -1)) {
-    LOG_PT_PERROR(pid, "pt_dynlib_process_needed_and_relocate");
+  if(elfldr_set_heap_size(pid, UINT64_MAX)) {
+    LOG_PT_PERROR(pid, "elfldr_set_heap_size");
+    pt_detach(pid, SIGKILL);
+    return -1;
   }
 
   // Insert a breakpoint at the eboot entry.
@@ -555,13 +562,13 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
   }
   brkpoint += 58; // offset to invocation of main()
 
-  if(mdbg_copyout(pid, brkpoint, &orginstr, sizeof(orginstr))) {
-    LOG_PERROR("mdbg_copyout");
+  if(pt_copyout(pid, brkpoint, &orginstr, sizeof(orginstr))) {
+    LOG_PERROR("pt_copyout");
     pt_detach(pid, SIGKILL);
     return -1;
   }
-  if(mdbg_copyin(pid, &int3instr, brkpoint, sizeof(int3instr))) {
-    LOG_PERROR("mdbg_copyin");
+  if(pt_copyin(pid, &int3instr, brkpoint, sizeof(int3instr))) {
+    LOG_PERROR("pt_copyin");
     pt_detach(pid, SIGKILL);
     return -1;
   }
@@ -577,8 +584,8 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
     pt_detach(pid, SIGKILL);
     return -1;
   }
-  if(mdbg_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
-    LOG_PERROR("mdbg_copyin");
+  if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
+    LOG_PERROR("pt_copyin");
     pt_detach(pid, SIGKILL);
     return -1;
   }
@@ -594,7 +601,7 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
 }
 
 /**
- * Read an ELF from a given socket.
+ * Read an ELF from a given socket. The memory is obtained from mmap().
  **/
 int
 elfldr_read(int fd, uint8_t **elf, size_t *elf_size) {
@@ -616,15 +623,25 @@ elfldr_read(int fd, uint8_t **elf, size_t *elf_size) {
     return -1;
   }
 
-  size = ehdr.e_shoff + ehdr.e_shnum * sizeof(Elf64_Ehdr);
-  if(!(buf = malloc(size))) {
+  if(ehdr.e_ident[EI_CLASS] != ELFCLASS64
+     || ehdr.e_shentsize != sizeof(Elf64_Shdr) || !ehdr.e_shnum
+     || ehdr.e_shoff < sizeof(ehdr)
+     || ehdr.e_shoff > SIZE_MAX - ehdr.e_shnum * sizeof(Elf64_Shdr)) {
+    errno = ENOEXEC;
+    return -1;
+  }
+
+  size = ehdr.e_shoff + ehdr.e_shnum * sizeof(Elf64_Shdr);
+  if((buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0))
+     == MAP_FAILED) {
     return -1;
   }
 
   memcpy(buf, &ehdr, sizeof(ehdr));
   rem = size - sizeof(ehdr);
   if(recv(fd, buf + sizeof(ehdr), rem, MSG_WAITALL) != rem) {
-    free(buf);
+    munmap(buf, size);
     return -1;
   }
 
@@ -633,6 +650,11 @@ elfldr_read(int fd, uint8_t **elf, size_t *elf_size) {
   for(int i = 0; i < ehdr.e_shnum; i++) {
     if(shdr[i].sh_type == SHT_NOBITS) {
       continue;
+    }
+    if(shdr[i].sh_size > SIZE_MAX - shdr[i].sh_offset) {
+      munmap(buf, size);
+      errno = ENOEXEC;
+      return -1;
     }
     size_t end = shdr[i].sh_offset + shdr[i].sh_size;
     if(end > shend) {
@@ -648,14 +670,18 @@ elfldr_read(int fd, uint8_t **elf, size_t *elf_size) {
   }
 
   bak = buf;
-  if(!(buf = realloc(buf, shend))) {
-    free(bak);
+  if((buf = mmap(NULL, shend, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0))
+     == MAP_FAILED) {
+    munmap(bak, size);
     return -1;
   }
 
+  memcpy(buf, bak, size);
+  munmap(bak, size);
   rem = shend - size;
   if(recv(fd, buf + size, rem, MSG_WAITALL) != rem) {
-    free(buf);
+    munmap(buf, shend);
     return -1;
   }
 
