@@ -30,6 +30,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 
 #include "elfldr.h"
 #include "log.h"
@@ -45,6 +46,11 @@ along with this program; see the file COPYING. If not, see
 #define PAYLOAD_MAGIC_FILE 0x656C6966 // file:// URI
 #define PAYLOAD_MAGIC_HTTP 0x70747468 // http:// or https:// URI
 #define PAYLOAD_MAGIC_POST 0x54534F50 // HTTP POST request
+
+/**
+ * Seconds a client may stay silent while a payload is being received.
+ **/
+#define RECV_TIMEOUT 10
 
 /**
  * Decode an escaped argument.
@@ -342,6 +348,19 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
 }
 
 /**
+ * Set how long a receive on a socket may wait for data, in seconds, or 0 to
+ * wait forever.
+ **/
+static void
+recv_timeout(int fd, time_t seconds) {
+  struct timeval tv = { .tv_sec = seconds };
+
+  if(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+    LOG_PERROR("setsockopt");
+  }
+}
+
+/**
  * Process connection input.
  **/
 static void
@@ -359,6 +378,8 @@ on_connection(int fd) {
     LOG_PERROR("setsockopt");
     return;
   }
+
+  recv_timeout(fd, RECV_TIMEOUT);
 
   if(recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL)
      != sizeof(magic)) {
@@ -395,6 +416,8 @@ on_connection(int fd) {
   }
 
   if(buf) {
+    recv_timeout(fd, 0);
+
     filename = uri_get_filename(uri);
     if(!filename || !*filename) {
       free(filename);
