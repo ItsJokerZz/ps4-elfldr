@@ -52,6 +52,9 @@ john@localhost:~$ echo "$PS4_PAYLOAD" | nc -q0 $PS4_HOST $PS4_PORT
 john@localhost:~$
 john@localhost:~$ export PS4_PAYLOAD=https://github.com/ps5-payload-dev/ftpsrv/releases/latest/download/ftpsrv-ps4.elf
 john@localhost:~$ echo "$PS4_PAYLOAD" | nc -q0 $PS4_HOST $PS4_PORT
+john@localhost:~$
+john@localhost:~$ export PS4_PAYLOAD=payload.elf # from local storage, via http post
+john@localhost:~$ curl --data-binary "@$PS4_PAYLOAD" "http://$PS4_HOST:$PS4_PORT/$PS4_PAYLOAD?args=-v&pipe=0"
 ```
 
 ## Reporting Bugs
