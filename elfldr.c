@@ -619,20 +619,21 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC | NOTE_EXIT, 0, 0);
   if(kevent(kq, &evt, 1, &evt, 1, 0) < 0) {
     LOG_PERROR("kevent");
+    kill(pid, SIGKILL);
     munmap(stack, MB(2));
     close(kq);
     return -1;
   }
 
-  while(pt_attach(pid) == -1) {
-    if(errno == EBUSY) {
-      continue;
+  for(int tries = 0; pt_attach(pid) == -1; tries++) {
+    if(errno != EBUSY || tries >= 5000) {
+      LOG_PERROR("pt_attach");
+      kill(pid, SIGKILL);
+      munmap(stack, MB(2));
+      close(kq);
+      return -1;
     }
-    LOG_PERROR("pt_attach");
-    kill(pid, SIGKILL);
-    munmap(stack, MB(2));
-    close(kq);
-    return -1;
+    usleep(1000);
   }
 
   munmap(stack, MB(2));
