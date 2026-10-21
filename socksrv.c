@@ -41,9 +41,10 @@ along with this program; see the file COPYING. If not, see
  * Magic number that socket input starts with (little endian).
  **/
 #define PAYLOAD_MAGIC_ELF 0x464C457F  // ELF payload
-#define PAYLOAD_MAGIC_SELF 0x1D3D154F // SELF payload
-#define PAYLOAD_MAGIC_FILE 0x656C6966 // file:// URI
-#define PAYLOAD_MAGIC_HTTP 0x70747468 // http:// or https:// URI
+#define PAYLOAD_MAGIC_URI_FILE 0x656C6966 // file:// URI
+#define PAYLOAD_MAGIC_URI_HTTP 0x70747468 // http:// or https:// URI
+#define PAYLOAD_MAGIC_PS4_SELF 0x1D3D154F // PS4 SELF payload
+#define PAYLOAD_MAGIC_HTTP_GET 0x20544547 // HTTP GET request
 
 /**
  * Decode an escaped argument.
@@ -139,7 +140,7 @@ payload_spawn(char *filename, char *args, int fd, uint8_t *payload,
       pid = elfldr_spawn(fd, argv, payload, payload_size);
     }
 
-  } else if(magic == PAYLOAD_MAGIC_SELF) {
+  } else if(magic == PAYLOAD_MAGIC_PS4_SELF) {
     pid = selfldr_spawn(fd, argv, payload, payload_size);
   }
 
@@ -181,6 +182,47 @@ payload_readuri(int fd, char *uri, size_t size) {
 }
 
 /**
+ * Read a HTTP (GET) request.
+ **/
+static int
+payload_readhttp(int fd, char *uri, size_t size) {
+  const char *headers = ("HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/plain; charset=utf-8\r\n"
+                         "Access-Control-Allow-Origin: *\r\n"
+                         "Connection: close\r\n"
+                         "\r\n");
+  char buf[PATH_MAX + 255] = { 0 };
+  char *param_uri;
+  ssize_t n;
+  char *p;
+
+  if((n = read(fd, buf, sizeof(buf) - 1)) < 0) {
+    return -1;
+  }
+
+  if(memcmp(buf, "GET ", 4)) {
+    return -1;
+  }
+
+  if(!(p = strchr(buf + 4, ' '))) {
+    return -1;
+  }
+
+  *p = 0;
+
+  if((param_uri = uri_get_param(buf + 4, "uri"))) {
+    strncpy(uri, param_uri, size);
+    free(param_uri);
+  } else {
+    snprintf(uri, size, "file:/%s", buf + 4);
+  }
+
+  write(fd, headers, strlen(headers));
+
+  return 0;
+}
+
+/**
  * Process connection input.
  **/
 static void
@@ -191,6 +233,8 @@ on_connection(int fd) {
   size_t len = 0;
   int optval = 1;
   char *args = "";
+  char *pipe = "";
+  int stdio = fd;
   int mapped = 0;
   int magic = 0;
   ssize_t n;
@@ -209,11 +253,18 @@ on_connection(int fd) {
     return;
   }
 
-  if(magic == PAYLOAD_MAGIC_FILE || magic == PAYLOAD_MAGIC_HTTP) {
+  if(magic == PAYLOAD_MAGIC_URI_FILE || magic == PAYLOAD_MAGIC_URI_HTTP) {
     if(payload_readuri(fd, uri, PATH_MAX)
        || uri_get_content(uri, &buf, &len)) {
-      LOG_PERROR("read_uri");
+      LOG_PERROR("payload_readuri");
       write(fd, "[elfldr.elf] Error reading URI payload\n\r\0", 41);
+    }
+
+  } else if(magic == PAYLOAD_MAGIC_HTTP_GET) {
+    if(payload_readhttp(fd, uri, PATH_MAX)
+       || uri_get_content(uri, &buf, &len)) {
+      LOG_PERROR("payload_readhttp");
+      write(fd, "[elfldr.elf] Error reading HTTP payload\n\r\0", 42);
     }
 
   } else if(magic == PAYLOAD_MAGIC_ELF) {
@@ -224,7 +275,7 @@ on_connection(int fd) {
       mapped = 1;
     }
 
-  } else if(magic == PAYLOAD_MAGIC_SELF) {
+  } else if(magic == PAYLOAD_MAGIC_PS4_SELF) {
     if(selfldr_read(fd, &buf, &len)) {
       LOG_PERROR("selfldr_read");
       write(fd, "[elfldr.elf] Error reading SELF payload\n\r\0", 42);
@@ -240,10 +291,20 @@ on_connection(int fd) {
     if(!(args = uri_get_param(uri, "args"))) {
       args = strdup("");
     }
-    if(payload_spawn(filename, args, fd, buf, len) < 0) {
+    if(!(pipe = uri_get_param(uri, "pipe"))) {
+      pipe = strdup("1");
+    }
+
+    if(!strcmp(pipe, "0") || !strcasecmp(pipe, "false")
+       || !strcasecmp(pipe, "no")) {
+      stdio = -1;
+    }
+
+    if(payload_spawn(filename, args, stdio, buf, len) < 0) {
       write(fd, "[elfldr.elf] Error spawning payload\n\r\0", 38);
     }
     free(filename);
+    free(pipe);
     free(args);
     if(mapped) {
       munmap(buf, len);
