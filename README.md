@@ -52,7 +52,15 @@ john@localhost:~$ echo "$PS4_PAYLOAD" | nc -q0 $PS4_HOST $PS4_PORT
 john@localhost:~$
 john@localhost:~$ export PS4_PAYLOAD=https://github.com/ps5-payload-dev/ftpsrv/releases/latest/download/ftpsrv-ps4.elf
 john@localhost:~$ echo "$PS4_PAYLOAD" | nc -q0 $PS4_HOST $PS4_PORT
+john@localhost:~$
+john@localhost:~$ curl "http://$PS4_HOST:$PS4_PORT?uri=$PS4_PAYLOAD"
 ```
+
+A payload URI accepts query parameters, e.g., `file:/data/payload.elf?args=-v&pipe=0`:
+- `args`: command line arguments for the payload, separated by spaces (a space
+  that belongs to an argument is escaped with a backslash).
+- `pipe`: set to `0`, `false` or `no` to keep the standard output of the payload
+  from being redirected to the connection.
 
 ## Reporting Bugs
 If you encounter problems with ps4-payload-elfldr, please [file a github issue][issues].
