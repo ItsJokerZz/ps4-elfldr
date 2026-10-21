@@ -30,7 +30,6 @@ along with this program; see the file COPYING. If not, see
 #include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <sys/sysctl.h>
 
 #include "elfldr.h"
 #include "log.h"
@@ -308,49 +307,6 @@ serve_elfldr(uint16_t port) {
   return close(srvfd);
 }
 
-/**
- * Fint the pid of a process with the given name.
- **/
-static pid_t
-find_pid(const char *name) {
-  int mib[4] = { 1, 14, 8, 0 };
-  pid_t mypid = getpid();
-  pid_t pid = -1;
-  size_t buf_size;
-  uint8_t *buf;
-
-  if(sysctl(mib, 4, 0, &buf_size, 0, 0)) {
-    LOG_PERROR("sysctl");
-    return -1;
-  }
-
-  if(!(buf = malloc(buf_size))) {
-    LOG_PERROR("malloc");
-    return -1;
-  }
-
-  if(sysctl(mib, 4, buf, &buf_size, 0, 0)) {
-    LOG_PERROR("sysctl");
-    free(buf);
-    return -1;
-  }
-
-  for(uint8_t *ptr = buf; ptr < (buf + buf_size);) {
-    int ki_structsize = *(int *)ptr;
-    pid_t ki_pid = *(pid_t *)&ptr[72];
-    char *ki_tdname = (char *)&ptr[447];
-
-    ptr += ki_structsize;
-    if(!strcmp(name, ki_tdname) && ki_pid != mypid) {
-      pid = ki_pid;
-    }
-  }
-
-  free(buf);
-
-  return pid;
-}
-
 static int
 notify_address(const char *prefix, int port) {
   char ip[INET_ADDRSTRLEN] = "127.0.0.1";
@@ -442,7 +398,7 @@ main(int argc, char* argv[]) {
   }
 
   syscall(SYS_setsid);
-  while((pid = find_pid("elfldr.elf")) > 0) {
+  while((pid = elfldr_find_pid("elfldr.elf")) > 0) {
     if(kill(pid, SIGKILL)) {
       LOG_PERROR("kill");
       _exit(-1);
