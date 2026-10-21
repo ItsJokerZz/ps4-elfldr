@@ -23,9 +23,16 @@ along with this program; see the file COPYING. If not, see
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
+#include <machine/psl.h>
+
 #include <ps4/kernel.h>
 
 #include "pt.h"
+
+/**
+ * The error of the most recent syscall issued with pt_syscall().
+ **/
+static int g_errno;
 
 int
 pt_attach(pid_t pid) {
@@ -141,6 +148,7 @@ pt_syscall(pid_t pid, int sysno, ...) {
   if(pt_getregs(pid, &sysc_reg)) {
     return -1;
   }
+  g_errno = (sysc_reg.r_rflags & PSL_C) ? (int)sysc_reg.r_rax : 0;
 
   if(pt_setregs(pid, &bak_reg)) {
     return -1;
@@ -196,4 +204,9 @@ pt_dynlib_get_proc_param(pid_t pid, intptr_t param_ptr, intptr_t size_ptr) {
 int
 pt_dynlib_process_needed_and_relocate(pid_t pid) {
   return (int)pt_syscall(pid, 0x257);
+}
+
+int
+pt_errno(pid_t pid) {
+  return g_errno;
 }

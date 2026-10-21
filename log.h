@@ -25,6 +25,16 @@ along with this program; see the file COPYING. If not, see
 #include "pt.h"
 
 /**
+ * Describe the error of the last syscall issued in a traced process.
+ **/
+static inline const char *
+pt_strerror(pid_t pid) {
+  int err = pt_errno(pid);
+
+  return err ? strerror(err) : "unknown error";
+}
+
+/**
  * Log to stdout and klog
  **/
 #define LOG_PUTS(s)                                                           \
@@ -47,6 +57,6 @@ along with this program; see the file COPYING. If not, see
 
 #define LOG_PT_PERROR(pid, s)                                                 \
   {                                                                           \
-    printf("%s:%d:%s: unknown error\n", __FILE__, __LINE__, s);               \
-    klog_printf("%s:%d:%s: unknown error\n", __FILE__, __LINE__, s);          \
+    printf("%s:%d:%s: %s\n", __FILE__, __LINE__, s, pt_strerror(pid));        \
+    klog_printf("%s:%d:%s: %s\n", __FILE__, __LINE__, s, pt_strerror(pid));   \
   }

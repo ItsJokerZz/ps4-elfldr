@@ -30,7 +30,6 @@ along with this program; see the file COPYING. If not, see
 #include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <sys/sysctl.h>
 
 #include "elfldr.h"
 #include "log.h"
@@ -42,9 +41,10 @@ along with this program; see the file COPYING. If not, see
  * Magic number that socket input starts with (little endian).
  **/
 #define PAYLOAD_MAGIC_ELF 0x464C457F  // ELF payload
-#define PAYLOAD_MAGIC_SELF 0x1D3D154F // SELF payload
-#define PAYLOAD_MAGIC_FILE 0x656C6966 // file:// URI
-#define PAYLOAD_MAGIC_HTTP 0x70747468 // http:// or https:// URI
+#define PAYLOAD_MAGIC_URI_FILE 0x656C6966 // file:// URI
+#define PAYLOAD_MAGIC_URI_HTTP 0x70747468 // http:// or https:// URI
+#define PAYLOAD_MAGIC_PS4_SELF 0x1D3D154F // PS4 SELF payload
+#define PAYLOAD_MAGIC_HTTP_GET 0x20544547 // HTTP GET request
 
 /**
  * Decode an escaped argument.
@@ -121,17 +121,26 @@ args_split(const char *args, char **argv, size_t size) {
 static pid_t
 payload_spawn(char *filename, char *args, int fd, uint8_t *payload,
               size_t payload_size) {
-  int magic = *((int *)payload);
   char *argv[255 + 2] = { 0 };
   pid_t pid = -1;
+  int magic;
 
+  if(payload_size < sizeof(magic)) {
+    return -1;
+  }
+
+  magic = *((int *)payload);
   argv[0] = filename;
   args_split(args, argv + 1, 255);
 
   if(magic == PAYLOAD_MAGIC_ELF) {
-    pid = elfldr_spawn(fd, argv, payload, payload_size);
+    if(elfldr_sanity_check(payload, payload_size)) {
+      LOG_PUTS("payload_spawn: malformed ELF");
+    } else {
+      pid = elfldr_spawn(fd, argv, payload, payload_size);
+    }
 
-  } else if(magic == PAYLOAD_MAGIC_SELF) {
+  } else if(magic == PAYLOAD_MAGIC_PS4_SELF) {
     pid = selfldr_spawn(fd, argv, payload, payload_size);
   }
 
@@ -173,6 +182,47 @@ payload_readuri(int fd, char *uri, size_t size) {
 }
 
 /**
+ * Read a HTTP (GET) request.
+ **/
+static int
+payload_readhttp(int fd, char *uri, size_t size) {
+  const char *headers = ("HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/plain; charset=utf-8\r\n"
+                         "Access-Control-Allow-Origin: *\r\n"
+                         "Connection: close\r\n"
+                         "\r\n");
+  char buf[PATH_MAX + 255] = { 0 };
+  char *param_uri;
+  ssize_t n;
+  char *p;
+
+  if((n = read(fd, buf, sizeof(buf) - 1)) < 0) {
+    return -1;
+  }
+
+  if(memcmp(buf, "GET ", 4)) {
+    return -1;
+  }
+
+  if(!(p = strchr(buf + 4, ' '))) {
+    return -1;
+  }
+
+  *p = 0;
+
+  if((param_uri = uri_get_param(buf + 4, "uri"))) {
+    strncpy(uri, param_uri, size);
+    free(param_uri);
+  } else {
+    snprintf(uri, size, "file:/%s", buf + 4);
+  }
+
+  write(fd, headers, strlen(headers));
+
+  return 0;
+}
+
+/**
  * Process connection input.
  **/
 static void
@@ -183,26 +233,38 @@ on_connection(int fd) {
   size_t len = 0;
   int optval = 1;
   char *args = "";
+  char *pipe = "";
+  int stdio = fd;
   int mapped = 0;
   int magic = 0;
+  ssize_t n;
 
   if(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0) {
     LOG_PERROR("setsockopt");
     return;
   }
 
-  if(recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL)
+  if((n = recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL))
      != sizeof(magic)) {
-    LOG_PERROR("recv");
+    if(n < 0) {
+      LOG_PERROR("recv");
+    }
     write(fd, "[elfldr.elf] Unknown payload format\n\r\0", 38);
     return;
   }
 
-  if(magic == PAYLOAD_MAGIC_FILE || magic == PAYLOAD_MAGIC_HTTP) {
+  if(magic == PAYLOAD_MAGIC_URI_FILE || magic == PAYLOAD_MAGIC_URI_HTTP) {
     if(payload_readuri(fd, uri, PATH_MAX)
        || uri_get_content(uri, &buf, &len)) {
-      LOG_PERROR("read_uri");
+      LOG_PERROR("payload_readuri");
       write(fd, "[elfldr.elf] Error reading URI payload\n\r\0", 41);
+    }
+
+  } else if(magic == PAYLOAD_MAGIC_HTTP_GET) {
+    if(payload_readhttp(fd, uri, PATH_MAX)
+       || uri_get_content(uri, &buf, &len)) {
+      LOG_PERROR("payload_readhttp");
+      write(fd, "[elfldr.elf] Error reading HTTP payload\n\r\0", 42);
     }
 
   } else if(magic == PAYLOAD_MAGIC_ELF) {
@@ -213,7 +275,7 @@ on_connection(int fd) {
       mapped = 1;
     }
 
-  } else if(magic == PAYLOAD_MAGIC_SELF) {
+  } else if(magic == PAYLOAD_MAGIC_PS4_SELF) {
     if(selfldr_read(fd, &buf, &len)) {
       LOG_PERROR("selfldr_read");
       write(fd, "[elfldr.elf] Error reading SELF payload\n\r\0", 42);
@@ -229,10 +291,20 @@ on_connection(int fd) {
     if(!(args = uri_get_param(uri, "args"))) {
       args = strdup("");
     }
-    if(payload_spawn(filename, args, fd, buf, len) < 0) {
+    if(!(pipe = uri_get_param(uri, "pipe"))) {
+      pipe = strdup("1");
+    }
+
+    if(!strcmp(pipe, "0") || !strcasecmp(pipe, "false")
+       || !strcasecmp(pipe, "no")) {
+      stdio = -1;
+    }
+
+    if(payload_spawn(filename, args, stdio, buf, len) < 0) {
       write(fd, "[elfldr.elf] Error spawning payload\n\r\0", 38);
     }
     free(filename);
+    free(pipe);
     free(args);
     if(mapped) {
       munmap(buf, len);
@@ -261,6 +333,7 @@ serve_elfldr(uint16_t port) {
   if(setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int))
      < 0) {
     LOG_PERROR("setsockopt");
+    close(srvfd);
     return -1;
   }
 
@@ -271,11 +344,13 @@ serve_elfldr(uint16_t port) {
 
   if(bind(srvfd, (struct sockaddr *)&srvaddr, sizeof(srvaddr)) != 0) {
     LOG_PERROR("bind");
+    close(srvfd);
     return -1;
   }
 
   if(listen(srvfd, 5) != 0) {
     LOG_PERROR("listen");
+    close(srvfd);
     return -1;
   }
 
@@ -291,49 +366,6 @@ serve_elfldr(uint16_t port) {
   }
 
   return close(srvfd);
-}
-
-/**
- * Fint the pid of a process with the given name.
- **/
-static pid_t
-find_pid(const char *name) {
-  int mib[4] = { 1, 14, 8, 0 };
-  pid_t mypid = getpid();
-  pid_t pid = -1;
-  size_t buf_size;
-  uint8_t *buf;
-
-  if(sysctl(mib, 4, 0, &buf_size, 0, 0)) {
-    LOG_PERROR("sysctl");
-    return -1;
-  }
-
-  if(!(buf = malloc(buf_size))) {
-    LOG_PERROR("malloc");
-    return -1;
-  }
-
-  if(sysctl(mib, 4, buf, &buf_size, 0, 0)) {
-    LOG_PERROR("sysctl");
-    free(buf);
-    return -1;
-  }
-
-  for(uint8_t *ptr = buf; ptr < (buf + buf_size);) {
-    int ki_structsize = *(int *)ptr;
-    pid_t ki_pid = *(pid_t *)&ptr[72];
-    char *ki_tdname = (char *)&ptr[447];
-
-    ptr += ki_structsize;
-    if(!strcmp(name, ki_tdname) && ki_pid != mypid) {
-      pid = ki_pid;
-    }
-  }
-
-  free(buf);
-
-  return pid;
 }
 
 static int
@@ -387,7 +419,7 @@ main(int argc, char* argv[]) {
   int port = 9021;
   int notify_user = 1;
   pid_t pid;
-  char c;
+  int c;
 
   syscall(SYS_thr_set_name, -1, "elfldr.elf");
   signal(SIGCHLD, SIG_IGN);
@@ -427,7 +459,7 @@ main(int argc, char* argv[]) {
   }
 
   syscall(SYS_setsid);
-  while((pid = find_pid("elfldr.elf")) > 0) {
+  while((pid = elfldr_find_pid("elfldr.elf")) > 0) {
     if(kill(pid, SIGKILL)) {
       LOG_PERROR("kill");
       _exit(-1);
