@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/mman.h>
 #include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -250,7 +251,8 @@ http_header(const char *request, const char *name) {
 }
 
 /**
- * Read a HTTP (POST) request, where the body is the payload to spawn.
+ * Read a HTTP (POST) request, where the body is the payload to spawn. Like
+ * the other large buffers of this loader, the body is obtained from mmap().
  **/
 static int
 payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
@@ -329,7 +331,9 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
     return http_error(fd, "400 Bad Request", EINVAL);
   }
 
-  if(!(body = malloc(length))) {
+  body = mmap(NULL, length, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if(body == MAP_FAILED) {
     return http_error(fd, "413 Payload Too Large", ENOMEM);
   }
 
@@ -339,13 +343,13 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
   }
 
   if(http_recv(fd, body, length)) {
-    free(body);
+    munmap(body, length);
     return -1;
   }
 
   memcpy(&magic, body, sizeof(magic));
   if(magic != PAYLOAD_MAGIC_ELF && magic != PAYLOAD_MAGIC_SELF) {
-    free(body);
+    munmap(body, length);
     return http_error(fd, "415 Unsupported Media Type", ENOEXEC);
   }
 
@@ -382,6 +386,7 @@ on_connection(int fd) {
   int optval = 1;
   char *args = "";
   char *pipe = "";
+  int mapped = 0;
   int magic = 0;
 
   if(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0) {
@@ -408,6 +413,8 @@ on_connection(int fd) {
   } else if(magic == PAYLOAD_MAGIC_POST) {
     if(payload_readpost(fd, uri, PATH_MAX, &buf, &len)) {
       LOG_PERROR("payload_readpost");
+    } else {
+      mapped = 1;
     }
 
   } else if(magic == PAYLOAD_MAGIC_ELF) {
@@ -451,7 +458,11 @@ on_connection(int fd) {
     free(filename);
     free(pipe);
     free(args);
-    free(buf);
+    if(mapped) {
+      munmap(buf, len);
+    } else {
+      free(buf);
+    }
   }
 }
 
