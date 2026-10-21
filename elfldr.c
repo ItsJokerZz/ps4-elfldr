@@ -522,6 +522,7 @@ elfldr_set_heap_size(pid_t pid, uint64_t size) {
  **/
 static int
 elfldr_set_procname(pid_t pid, const char *name) {
+  char comm[MAXCOMLEN + 1];
   intptr_t buf;
 
   if((buf = pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
@@ -531,7 +532,10 @@ elfldr_set_procname(pid_t pid, const char *name) {
     return -1;
   }
 
-  pt_copyin(pid, name, buf, strlen(name) + 1);
+  strncpy(comm, name, sizeof(comm) - 1);
+  comm[sizeof(comm) - 1] = 0;
+
+  pt_copyin(pid, comm, buf, strlen(comm) + 1);
 
   pt_syscall(pid, SYS_thr_set_name, -1, buf);
   pt_msync(pid, buf, PAGE_SIZE, MS_SYNC);
@@ -691,7 +695,7 @@ elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
   }
 
   // Execute the ELF
-  elfldr_set_procname(pid, "Payload");
+  elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload");
   if(elfldr_exec(pid, stdio, elf)) {
     kill(pid, SIGKILL);
     return -1;
