@@ -203,7 +203,7 @@ elfldr_page_protection(const Elf64_Phdr *phdr, unsigned count, uintptr_t page) {
 /**
  * Load an ELF into the address space of a process with the given pid.
  **/
-static intptr_t
+intptr_t
 elfldr_load(pid_t pid, uint8_t *elf) {
   Elf64_Ehdr *ehdr = (Elf64_Ehdr *)elf;
   Elf64_Phdr *phdr = (Elf64_Phdr *)(elf + ehdr->e_phoff);
