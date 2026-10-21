@@ -30,6 +30,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 
 #include "elfldr.h"
 #include "log.h"
@@ -46,6 +47,11 @@ along with this program; see the file COPYING. If not, see
 #define PAYLOAD_MAGIC_PS4_SELF 0x1D3D154F // PS4 SELF payload
 #define PAYLOAD_MAGIC_HTTP_GET 0x20544547 // HTTP GET request
 #define PAYLOAD_MAGIC_HTTP_POST 0x54534F50 // HTTP POST request
+
+/**
+ * Seconds a client may stay silent while a payload is being received.
+ **/
+#define RECV_TIMEOUT 10
 
 /**
  * Decode an escaped argument.
@@ -245,21 +251,31 @@ http_error(int fd, const char *status, int err) {
 }
 
 /**
- * Receive exactly len bytes from a socket.
+ * Receive exactly len bytes from a socket. The data is received in chunks, so
+ * that the receive timeout of the socket applies to the time a client is idle,
+ * not to the time it takes to upload the whole body.
  **/
 static int
 http_recv(int fd, void *buf, size_t len) {
-  ssize_t n = recv(fd, buf, len, MSG_WAITALL);
+  uint8_t *p = buf;
 
-  if(n == len) {
-    return 0;
+  while(len) {
+    size_t chunk = len < 0x10000 ? len : 0x10000;
+    ssize_t n = recv(fd, p, chunk, MSG_WAITALL);
+
+    if(n != chunk) {
+      if(n >= 0) {
+        errno = ECONNRESET;
+      }
+
+      return -1;
+    }
+
+    p += n;
+    len -= n;
   }
 
-  if(n >= 0) {
-    errno = ECONNRESET;
-  }
-
-  return -1;
+  return 0;
 }
 
 /**
@@ -285,7 +301,8 @@ http_header(const char *request, const char *name) {
 }
 
 /**
- * Read a HTTP (POST) request, where the body is the payload to spawn.
+ * Read a HTTP (POST) request, where the body is the payload to spawn. Like
+ * the other large buffers of this loader, the body is obtained from mmap().
  **/
 static int
 payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
@@ -364,7 +381,9 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
     return http_error(fd, "400 Bad Request", EINVAL);
   }
 
-  if(!(body = malloc(length))) {
+  body = mmap(NULL, length, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if(body == MAP_FAILED) {
     return http_error(fd, "413 Payload Too Large", ENOMEM);
   }
 
@@ -374,13 +393,13 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
   }
 
   if(http_recv(fd, body, length)) {
-    free(body);
+    munmap(body, length);
     return -1;
   }
 
   memcpy(&magic, body, sizeof(magic));
   if(magic != PAYLOAD_MAGIC_ELF && magic != PAYLOAD_MAGIC_PS4_SELF) {
-    free(body);
+    munmap(body, length);
     return http_error(fd, "415 Unsupported Media Type", ENOEXEC);
   }
 
@@ -390,6 +409,19 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
   *payload_size = length;
 
   return 0;
+}
+
+/**
+ * Set how long a receive on a socket may wait for data, in seconds, or 0 to
+ * wait forever.
+ **/
+static void
+recv_timeout(int fd, time_t seconds) {
+  struct timeval tv = { .tv_sec = seconds };
+
+  if(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+    LOG_PERROR("setsockopt");
+  }
 }
 
 /**
@@ -413,6 +445,8 @@ on_connection(int fd) {
     LOG_PERROR("setsockopt");
     return;
   }
+
+  recv_timeout(fd, RECV_TIMEOUT);
 
   if((n = recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL))
      != sizeof(magic)) {
@@ -440,6 +474,8 @@ on_connection(int fd) {
   } else if(magic == PAYLOAD_MAGIC_HTTP_POST) {
     if(payload_readpost(fd, uri, PATH_MAX, &buf, &len)) {
       LOG_PERROR("payload_readpost");
+    } else {
+      mapped = 1;
     }
 
   } else if(magic == PAYLOAD_MAGIC_ELF) {
@@ -460,6 +496,8 @@ on_connection(int fd) {
   }
 
   if(buf) {
+    recv_timeout(fd, 0);
+
     filename = uri_get_filename(uri);
     if(!filename || !*filename) {
       free(filename);
