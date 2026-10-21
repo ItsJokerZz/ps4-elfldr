@@ -174,6 +174,11 @@ elfldr_load(pid_t pid, uint8_t *elf) {
     }
   }
 
+  if(min_vaddr == (size_t)-1) {
+    LOG_PUTS("elfldr_load: ELF has no loadable segments");
+    return 0;
+  }
+
   min_vaddr = TRUNC_PG(min_vaddr);
   max_vaddr = ROUND_PG(max_vaddr);
   ctx.base_size = max_vaddr - min_vaddr;
