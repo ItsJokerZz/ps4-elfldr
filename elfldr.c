@@ -695,7 +695,7 @@ elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
   }
 
   // Execute the ELF
-  elfldr_set_procname(pid, "Payload");
+  elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload");
   if(elfldr_exec(pid, stdio, elf)) {
     kill(pid, SIGKILL);
     return -1;
