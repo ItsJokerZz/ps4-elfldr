@@ -194,15 +194,18 @@ on_connection(int fd) {
   char *args = "";
   int mapped = 0;
   int magic = 0;
+  ssize_t n;
 
   if(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0) {
     LOG_PERROR("setsockopt");
     return;
   }
 
-  if(recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL)
+  if((n = recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL))
      != sizeof(magic)) {
-    LOG_PERROR("recv");
+    if(n < 0) {
+      LOG_PERROR("recv");
+    }
     write(fd, "[elfldr.elf] Unknown payload format\n\r\0", 38);
     return;
   }
@@ -270,6 +273,7 @@ serve_elfldr(uint16_t port) {
   if(setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int))
      < 0) {
     LOG_PERROR("setsockopt");
+    close(srvfd);
     return -1;
   }
 
@@ -280,11 +284,13 @@ serve_elfldr(uint16_t port) {
 
   if(bind(srvfd, (struct sockaddr *)&srvaddr, sizeof(srvaddr)) != 0) {
     LOG_PERROR("bind");
+    close(srvfd);
     return -1;
   }
 
   if(listen(srvfd, 5) != 0) {
     LOG_PERROR("listen");
+    close(srvfd);
     return -1;
   }
 
