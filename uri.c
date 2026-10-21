@@ -79,7 +79,7 @@ http_init(http_ctx_t *ctx, const char *agent, const char *url) {
   ctx->reqId = -1;
 
   if((err = sceNetInit()) < 0) {
-    return -1;
+    return err;
   }
 
   ctx->libnetMemId = sceNetPoolCreate("http_get", 16 * 1024, 0);
