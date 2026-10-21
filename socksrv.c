@@ -402,7 +402,7 @@ main(int argc, char* argv[]) {
   int port = 9021;
   int notify_user = 1;
   pid_t pid;
-  char c;
+  int c;
 
   syscall(SYS_thr_set_name, -1, "elfldr.elf");
   signal(SIGCHLD, SIG_IGN);
