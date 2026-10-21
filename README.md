@@ -54,6 +54,9 @@ john@localhost:~$ export PS4_PAYLOAD=https://github.com/ps5-payload-dev/ftpsrv/r
 john@localhost:~$ echo "$PS4_PAYLOAD" | nc -q0 $PS4_HOST $PS4_PORT
 john@localhost:~$
 john@localhost:~$ curl "http://$PS4_HOST:$PS4_PORT?uri=$PS4_PAYLOAD"
+john@localhost:~$
+john@localhost:~$ export PS4_PAYLOAD=payload.elf # from local storage, via http post
+john@localhost:~$ curl --data-binary "@$PS4_PAYLOAD" "http://$PS4_HOST:$PS4_PORT/$PS4_PAYLOAD?args=-v&pipe=0"
 ```
 
 A payload URI accepts query parameters, e.g., `file:/data/payload.elf?args=-v&pipe=0`:
