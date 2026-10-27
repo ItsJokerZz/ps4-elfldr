@@ -42,6 +42,7 @@ main(void) {
           0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
   unsigned int fw = kernel_get_fw_version();
   intptr_t pt_patch = 0; // (req < 0x2b)
+  unsigned short pt_patch_size = 6;
   unsigned char caps[16];
   unsigned long jaildir;
   unsigned long rootdir;
@@ -52,6 +53,18 @@ main(void) {
   LOG_PUTS("Bootstrapping elfldr.elf...");
 
   switch(fw & 0xffff0000) {
+    case 0x3500000:
+    case 0x3550000:
+    case 0x3700000:
+      if((pt_patch = kernel_find_pattern(
+              KERNEL_ADDRESS_IMAGE_BASE, KERNEL_IMAGE_SIZE,
+              "48b8810ef000000400004c0fa3c07326"
+              "????????????????????????????????????????????????????????????????"
+              "41bf0100000085db7469"))) {
+        pt_patch += 56; // The 3.x kernels use a 2-byte conditional branch here.
+        pt_patch_size = 2;
+      }
+      break;
     case 0x4000000:
     case 0x4010000:
     case 0x4050000:
@@ -103,6 +116,7 @@ main(void) {
     case 0x7550000:
     case 0x8000000:
     case 0x8010000:
+    case 0x8020000:
     case 0x8030000:
     case 0x8500000:
     case 0x8520000:
@@ -158,7 +172,7 @@ main(void) {
 
   if(pt_patch) {
     LOG_PRINTF("pathing kernel at 0x%lx (ptrace)\n", pt_patch);
-    kernel_patch(pt_patch, 0, "\x90\x90\x90\x90\x90\x90", 6);
+    kernel_patch(pt_patch, 0, "\x90\x90\x90\x90\x90\x90", pt_patch_size);
   }
 
   if((err = kernel_get_ucred_caps(-1, caps))) {
