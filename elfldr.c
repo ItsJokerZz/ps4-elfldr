@@ -587,11 +587,67 @@ elfldr_rfork_entry(void *argv) {
 }
 
 /**
- * Execute an ELF inside a new process.
+ * How long a new process is watched for a failure to start, in milliseconds,
+ * and how many times it is spawned again.
  **/
-pid_t
-elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
-             size_t elf_size) {
+#define SPAWN_WATCH_MS 1000
+#define SPAWN_RETRIES 3
+
+/**
+ * Get notified when a process exits.
+ **/
+static int
+elfldr_watch(pid_t pid) {
+  struct kevent evt;
+  int kq;
+
+  if((kq = kqueue()) < 0) {
+    return -1;
+  }
+
+  EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, 0);
+  if(kevent(kq, &evt, 1, 0, 0, 0) < 0) {
+    close(kq);
+    return -1;
+  }
+
+  return kq;
+}
+
+/**
+ * Check if a watched process exits with status 255 soon after it was started,
+ * which is what the runtime of a payload does when it fails to load a library.
+ **/
+static int
+elfldr_start_failed(int kq) {
+  struct timespec ts = { .tv_sec = SPAWN_WATCH_MS / 1000,
+                         .tv_nsec = SPAWN_WATCH_MS % 1000 * 1000000 };
+  struct kevent evt;
+  int status;
+  int n;
+
+  if(kq < 0) {
+    return 0;
+  }
+
+  n = kevent(kq, 0, 0, &evt, 1, &ts);
+  close(kq);
+
+  if(n != 1 || !(evt.fflags & NOTE_EXIT)) {
+    return 0;
+  }
+
+  status = evt.data;
+
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0xff;
+}
+
+/**
+ * Execute an ELF inside a new process, and tell if it failed to start.
+ **/
+static pid_t
+elfldr_spawn_once(int stdio, char *const argv[], const uint8_t *elf,
+                  size_t elf_size, int *failed) {
   uint8_t int3instr = 0xcc;
   struct kevent evt;
   intptr_t brkpoint;
@@ -696,9 +752,41 @@ elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
 
   // Execute the ELF
   elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload");
+  kq = elfldr_watch(pid);
   if(elfldr_exec(pid, stdio, elf)) {
     kill(pid, SIGKILL);
+    if(kq >= 0) {
+      close(kq);
+    }
     return -1;
+  }
+
+  *failed = elfldr_start_failed(kq);
+
+  return pid;
+}
+
+/**
+ * Execute an ELF inside a new process. A payload that fails to start is
+ * spawned again, since it tends to start fine the next time.
+ **/
+pid_t
+elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
+             size_t elf_size) {
+  int failed = 0;
+  pid_t pid;
+
+  for(int tries = 0; tries <= SPAWN_RETRIES; tries++) {
+    if(tries) {
+      LOG_PRINTF("Payload failed to start, retrying (%d/%d)\n", tries,
+                 SPAWN_RETRIES);
+      usleep(100000);
+    }
+
+    pid = elfldr_spawn_once(stdio, argv, elf, elf_size, &failed);
+    if(pid < 0 || !failed) {
+      break;
+    }
   }
 
   return pid;
