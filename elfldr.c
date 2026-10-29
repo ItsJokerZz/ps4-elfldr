@@ -594,6 +594,71 @@ elfldr_rfork_entry(void *argv) {
 #define SPAWN_RETRIES 3
 
 /**
+ * The fewest modules, and the highest module handle, a host has had when it
+ * reached main(), and the number of starts in a row that had more.
+ **/
+static int host_modules = 0;
+static unsigned int host_handle = 0;
+static int host_busy = 0;
+
+/**
+ * Check if the host process has begun to load libraries by itself, which
+ * leaves it unable to load libraries for the payload. A host that has more
+ * modules every time is taken as it is after a few starts.
+ **/
+static int
+elfldr_host_busy(pid_t pid) {
+  unsigned int hmax = 0;
+  int n = 0;
+
+  for(unsigned int h = 0; h < 64; h++) {
+    dynlib_obj_t obj;
+
+    if(kernel_dynlib_obj(pid, h, &obj) < 0) {
+      continue;
+    }
+    n++;
+    hmax = h;
+  }
+
+  if(!host_modules || (n <= host_modules && hmax <= host_handle)) {
+    host_modules = n;
+    host_handle = hmax;
+    host_busy = 0;
+    return 0;
+  }
+
+  if(++host_busy > 3) {
+    host_modules = n;
+    host_handle = hmax;
+    host_busy = 0;
+    return 0;
+  }
+
+  for(unsigned int h = host_handle + 1; h <= hmax; h++) {
+    const char *name;
+    dynlib_obj_t obj;
+    char path[256] = { 0 };
+
+    if(kernel_dynlib_obj(pid, h, &obj) < 0) {
+      continue;
+    }
+    if(obj.path) {
+      kernel_copyout(obj.path, path, sizeof(path) - 1);
+    }
+    name = path;
+    for(const char *p = path; *p; p++) {
+      if(*p == '/') {
+        name = p + 1;
+      }
+    }
+    LOG_PRINTF("Host process has loaded %s\n", name);
+  }
+
+  return 1;
+}
+
+/**
  * Get notified when a process exits.
  **/
 static int
@@ -750,6 +815,15 @@ elfldr_spawn_once(int stdio, char *const argv[], const uint8_t *elf,
     return -1;
   }
 
+  // A host that has begun to load libraries by itself makes the payload fail
+  // to load its own, start over with a new process.
+  if(elfldr_host_busy(pid)) {
+    LOG_PUTS("Host process is not clean, starting over");
+    pt_detach(pid, SIGKILL);
+    *failed = 1;
+    return pid;
+  }
+
   // Execute the ELF
   elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload");
   kq = elfldr_watch(pid);
@@ -774,6 +848,7 @@ pid_t
 elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
              size_t elf_size) {
   int failed = 0;
+  int errors = 0;
   pid_t pid;
 
   for(int tries = 0; tries <= SPAWN_RETRIES; tries++) {
@@ -784,7 +859,12 @@ elfldr_spawn(int stdio, char *const argv[], const uint8_t *elf,
     }
 
     pid = elfldr_spawn_once(stdio, argv, elf, elf_size, &failed);
-    if(pid < 0 || !failed) {
+    if(pid < 0) {
+      // a payload that could not be spawned gets one more try
+      if(errors++) {
+        break;
+      }
+    } else if(!failed) {
       break;
     }
   }
