@@ -846,6 +846,7 @@ elfldr_spawn_once(int stdio, char *const argv[], uint8_t *elf,
 pid_t
 elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
   int failed = 0;
+  int errors = 0;
   pid_t pid;
 
   for(int tries = 0; tries <= SPAWN_RETRIES; tries++) {
@@ -856,7 +857,12 @@ elfldr_spawn(int stdio, char *const argv[], uint8_t *elf, size_t elf_size) {
     }
 
     pid = elfldr_spawn_once(stdio, argv, elf, elf_size, &failed);
-    if(pid < 0 || !failed) {
+    if(pid < 0) {
+      // a payload that could not be spawned gets one more try
+      if(errors++) {
+        break;
+      }
+    } else if(!failed) {
       break;
     }
   }
